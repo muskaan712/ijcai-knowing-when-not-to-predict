@@ -1,428 +1,320 @@
 import os
 import glob
-import time
 import warnings
+from datetime import datetime
 
 import numpy as np
 import pandas as pd
-from pandas import DataFrame
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
-import torchvision
-import torchvision.models as models
-
-from torch.utils.data import Dataset, DataLoader
-from torchvision.datasets import ImageFolder
-from torchvision.transforms import (
-    Compose,
-    RandomResizedCrop,
-    RandomHorizontalFlip,
-    RandomVerticalFlip,
-    ColorJitter,
-    RandomGrayscale,
-    RandomApply,
-    GaussianBlur,
-    Resize,
-    ToTensor,
-    RandomRotation,
-    RandomAffine,
-    Normalize,
-    functional,
-    RandomCrop,
-    CenterCrop
+import torchvision.transforms as T
+from PIL import Image
+from sklearn.metrics import (
+    accuracy_score,
+    confusion_matrix,
+    f1_score,
+    precision_score,
+    recall_score,
 )
+from torch.utils.data import DataLoader
+from torchvision import models
+from torchvision.datasets import ImageFolder
 from tqdm import tqdm
-
-from sklearn.preprocessing import MinMaxScaler
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import confusion_matrix, classification_report, cohen_kappa_score
-
-# import albumentations as A  # Uncomment if needed.
 
 warnings.filterwarnings("ignore")
 
-print(f"Torch-Version {torch.__version__}")
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-print(f"DEVICE: {DEVICE}")
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Using device: {device}\n")
+
+def exclude_bias_and_norm(n):
+    return n.endswith(".bias") or "norm" in n.lower()
+
+# =============================================================
+# 1 ──────────────────────── Data transforms
+# =============================================================
+class RemoveBackgroundTransform:
+    """Zero‑out low‑intensity background pixels (very coarse)."""
+
+    def __init__(self, threshold: int = 10):
+        self.threshold = threshold
+
+    def __call__(self, img: Image.Image) -> Image.Image:
+        import cv2  # local import keeps global deps minimal
+
+        arr = np.array(img)
+        gray = cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY)
+        _, mask = cv2.threshold(gray, self.threshold, 255, cv2.THRESH_BINARY)
+        arr[mask == 0] = 0
+        return Image.fromarray(arr)
 
 
-# ------------------------------------------------------------------------
-# Transforms for Training and Validation
-# ------------------------------------------------------------------------
-r_crop = RandomResizedCrop(224)
-r_fliph = RandomHorizontalFlip()
-ttensor = ToTensor()
+class CLAHETransform:
+    """Apply CLAHE per‑image (improves local contrast)."""
 
-custom_transform_train = Compose([
-    r_crop,
-    r_fliph,
-    ttensor,
-])
+    def __init__(self, clip_limit: float = 2.0, tile_grid_size=(8, 8)):
+        import cv2
 
-resize = Resize(256)
-ccrop = CenterCrop(224)
-ttensor = ToTensor()
+        self.clahe = cv2.createCLAHE(clipLimit=clip_limit, tileGridSize=tile_grid_size)
 
-custom_transform_val = Compose([
-    resize,
-    ccrop,
-    ttensor,
-])
+    def __call__(self, img: Image.Image) -> Image.Image:
+        import cv2
+
+        arr = np.array(img)
+        if arr.ndim == 3 and arr.shape[2] == 3:
+            lab = cv2.cvtColor(arr, cv2.COLOR_RGB2LAB)
+            l, a, b = cv2.split(lab)
+            l = self.clahe.apply(l)
+            lab = cv2.merge((l, a, b))
+            arr = cv2.cvtColor(lab, cv2.COLOR_LAB2RGB)
+        else:
+            arr = self.clahe.apply(arr)
+        return Image.fromarray(arr)
 
 
-# ------------------------------------------------------------------------
-# Datasets and Dataloaders
-# ------------------------------------------------------------------------
-"""
-Using ImageFolder for training and validation. Update paths if needed.
-"""
-
-train2_ds = ImageFolder(
-    root="/home/s13mchop/HybridML/data/aptos/train",
-    transform=custom_transform_train
-)
-print(f"Number of training samples: {len(train2_ds)}")
-
-valid2_ds = ImageFolder(
-    root="/home/s13mchop/HybridML/data/aptos/test",
-    transform=custom_transform_val
-)
-print(f"Number of validation samples: {len(valid2_ds)}")
-
-# Optionally limit dataset size (uncomment if desired)
-# train_size = int(0.5 * len(train2_ds))
-# valid_size = int(0.5 * len(valid2_ds))
-# train2_ds, _ = torch.utils.data.random_split(train2_ds, [train_size, len(train2_ds) - train_size])
-# valid2_ds, _ = torch.utils.data.random_split(valid2_ds, [valid_size, len(valid2_ds) - valid_size])
-
-nu_classes = 5
-BATCH_SIZE = 256
-
-train_dl = DataLoader(
-    train2_ds,
-    batch_size=BATCH_SIZE,
-    shuffle=True,
-    num_workers=os.cpu_count(),
-    drop_last=True,
-    pin_memory=True,
+transform = T.Compose(
+    [
+        T.Resize((512, 512)),
+        RemoveBackgroundTransform(10),
+        CLAHETransform(clip_limit=2.0),
+        T.RandomHorizontalFlip(),
+        T.ToTensor(),
+    ]
 )
 
-valid_dl = DataLoader(
-    valid2_ds,
-    batch_size=BATCH_SIZE,
-    shuffle=True,
-    num_workers=os.cpu_count(),
-    drop_last=True,
-    pin_memory=True,
-)
+# =============================================================
+# 2 ─────────────────────────────── Dataset
+# =============================================================
+TRAIN_PATH = "/home/s13mchop/HybridML/data/aptos/train"
+VAL_PATH = "/home/s13mchop/HybridML/data/aptos/test"
+BATCH_SIZE = 32
+NUM_WORKERS = os.cpu_count() or 4
 
+train_ds = ImageFolder(TRAIN_PATH, transform)
+val_ds = ImageFolder(VAL_PATH, transform)
 
-# ------------------------------------------------------------------------
-# SiCoVa Definition
-# ------------------------------------------------------------------------
-class SiCoVa(nn.Module):
-    """
-    A neural network that implements SiCoVa with a ResNet50 encoder
-    and an MLP expander. This model is primarily used for self-supervised
-    learning and can be finetuned or used for feature extraction.
-    """
-    def __init__(self):
-        """
-        Initialize the SiCoVa with a pretrained ResNet50 backbone
-        truncated before the final fully connected layer, then flatten
-        the output, and finally an MLP expansion layer.
-        """
+train_loader = DataLoader(train_ds, BATCH_SIZE, True, num_workers=NUM_WORKERS, drop_last=True, pin_memory=True)
+val_loader = DataLoader(val_ds, BATCH_SIZE, False, num_workers=NUM_WORKERS, drop_last=False, pin_memory=True)
+
+print(f"Dataset sizes  ▶  train: {len(train_ds)}   val: {len(val_ds)}")
+
+# =============================================================
+# 3 ──────────────────────────── Model pieces
+# =============================================================
+class CAMExtractor(nn.Module):
+    def __init__(self, in_channels: int = 2048):
         super().__init__()
-        self.encoder = models.resnet50(pretrained=True)
-        # Remove the original fully connected layer and add flatten
-        self.encoder = nn.Sequential(
-            *(list(self.encoder.children())[:-1]),
-            nn.Flatten()
-        )
+        self.conv = nn.Conv2d(in_channels, 1, 1, bias=False)
+
+    def forward(self, feat_map):  # [B,C,H,W]
+        cam = F.relu(self.conv(feat_map)).squeeze(1)  # [B,H,W]
+        B, H, W = cam.shape
+        flat = cam.view(B, -1)
+        cam = (flat - flat.min(1, keepdim=True)[0]) / (flat.max(1, keepdim=True)[0] + 1e-5)
+        return cam.view(B, H, W)
+
+
+class RefinementCAM(nn.Module):
+    def __init__(self, thresholds=(0.3, 0.4, 0.5)):
+        super().__init__()
+        self.thresholds = thresholds
+
+    def forward(self, cam, feat):  # cam [B,H,W], feat [B,C,H,W]
+        masks = [(cam >= t).float() for t in self.thresholds]
+        mask = torch.stack(masks, 1).mean(1).unsqueeze(1)  # [B,1,H,W]
+        if mask.shape[-2:] != feat.shape[-2:]:
+            raise RuntimeError("CAM/feature size mismatch, check extractor.")
+        masked = feat * mask
+        refined = self.self_attention(cam, masked)
+        loss = F.l1_loss(refined, cam.detach())
+        return refined, loss
+
+    @staticmethod
+    def self_attention(cam, feat):
+        B, C, H, W = feat.shape
+        feat_flat = F.normalize(feat.view(B, C, -1), dim=1)
+        sim = torch.bmm(feat_flat.transpose(1, 2), feat_flat)  # [B,HW,HW]
+        cam_flat = cam.view(B, -1, 1)
+        refined = torch.bmm(sim, cam_flat).squeeze(-1)
+        refined = (refined - refined.min(1, keepdim=True)[0]) / (refined.max(1, keepdim=True)[0] + 1e-5)
+        return refined.view(B, H, W)
+
+
+class VICRegNet(nn.Module):
+    def __init__(self):
+        super().__init__()
+        base = models.resnet50(weights=models.ResNet50_Weights.IMAGENET1K_V2)
+        self.backbone = nn.Sequential(*list(base.children())[:-2])
+        self.avgpool = nn.AdaptiveAvgPool2d(1)
+        # projection head kept for weight‑loading compatibility
         self.expander = nn.Sequential(
             nn.Linear(2048, 8192),
             nn.BatchNorm1d(8192),
-            nn.ReLU(),
+            nn.ReLU(inplace=True),
             nn.Linear(8192, 8192),
             nn.BatchNorm1d(8192),
-            nn.ReLU(),
-            nn.Linear(8192, 8192)
+            nn.ReLU(inplace=True),
+            nn.Linear(8192, 8192),
         )
 
     def forward(self, x):
-        """
-        Forward pass through the ResNet50 encoder and MLP expander.
-
-        Args:
-            x (torch.Tensor): Image batch of shape [batch_size, 3, height, width]
-
-        Returns:
-            torch.Tensor: Expanded embedding of shape [batch_size, 8192]
-        """
-        _repr = self.encoder(x)
-        _embeds = self.expander(_repr)
-        return _embeds
+        fmap = self.backbone(x)
+        pooled = self.avgpool(fmap).view(x.size(0), -1)
+        embeds = self.expander(pooled)
+        return fmap, pooled, embeds
 
 
-# ------------------------------------------------------------------------
-# Identity Layer
-# ------------------------------------------------------------------------
-class Identity(nn.Module):
-    """
-    An identity layer that simply returns its input. Useful for replacing
-    parts of a model (e.g., projector head) that are not required during
-    finetuning or linear evaluation.
-    """
-    def __init__(self):
-        super(Identity, self).__init__()
-
-    def forward(self, x):
-        """
-        Forward pass that does nothing but return the input unchanged.
-
-        Args:
-            x (torch.Tensor): Input tensor of any shape
-
-        Returns:
-            torch.Tensor: Same tensor as input
-        """
-        return x
-
-
-# ------------------------------------------------------------------------
-# LinearEvaluation Model
-# ------------------------------------------------------------------------
-class LinearEvaluation(nn.Module):
-    """
-    A classification head on top of a pretrained SiCoVa encoder for
-    downstream tasks. Optionally, you can allow finetuning of the encoder
-    by setting requires_grad=True for its parameters.
-    """
-
-    def __init__(self, model, nu_classes):
-        """
-        Args:
-            model (SiCoVa): The pretrained SiCoVa model to wrap.
-            nu_classes (int): Number of classes for classification.
-        """
+class CAMClassification(nn.Module):
+    def __init__(self, backbone, num_classes=5, alpha=0.1):
         super().__init__()
-        # Store the pretrained SiCoVa model
-        SiCoVa = model
-
-        # Indicate that we are in linear_eval (or finetune) mode
-        SiCoVa.linear_eval = True
-
-        # Replace the projector (expander) with Identity if you only
-        # want to use the 2048-dim features directly from the ResNet encoder.
-        SiCoVa.projector = Identity()
-
-        self.SiCoVa = SiCoVa
-
-        # By default, allow gradient updates on entire model (encoder + linear)
-        for param in self.SiCoVa.parameters():
-            param.requires_grad = True
-
-        # A linear layer from the 2048-dim encoder output to the number of classes
-        self.linear = nn.Linear(2048, nu_classes)
+        self.backbone = backbone
+        self.cls_head = nn.Linear(2048, num_classes)
+        self.cam_extractor = CAMExtractor(2048)
+        self.refiner = RefinementCAM()
+        self.alpha = alpha
 
     def forward(self, x):
-        """
-        Forward pass for classification.
-
-        Args:
-            x (torch.Tensor): Image batch [batch_size, 3, height, width]
-
-        Returns:
-            torch.Tensor: Logits of shape [batch_size, nu_classes]
-        """
-        features = self.SiCoVa.encoder(x)
-        features = torch.squeeze(features)
-        pred = self.linear(features)
-        return pred
+        fmap, pooled, _ = self.backbone(x)
+        logits = self.cls_head(pooled)
+        cam0 = self.cam_extractor(fmap)
+        cam, loss_ref = self.refiner(cam0, fmap)
+        return logits, cam, loss_ref
 
 
-# ------------------------------------------------------------------------
-# Instantiate and Prepare Model
-# ------------------------------------------------------------------------
-model = SiCoVa()
-SiCoVa_model = model.to(DEVICE)
+# =============================================================
+# 4 ──────────────────────────── Utils
+# =============================================================
 
-# Load pretrained checkpoint
-pretrained_path = "/home/s13mchop/HybridML/experiments/pretrain/VR1/SiCoVa_resnet50_200"
-SiCoVa_model.load_state_dict(torch.load(pretrained_path))
-print(f"Loaded SiCoVa model from: {pretrained_path}")
-
-# Create linear evaluation model
-eval_model = LinearEvaluation(SiCoVa_model, nu_classes).to(DEVICE)
-
-# Set up criterion, optimizer, scheduler
-criterion_eval = nn.CrossEntropyLoss().to(DEVICE)
-optimizer_eval = torch.optim.SGD(eval_model.parameters(), lr=0.003, momentum=0.9, weight_decay=1e-4)
-scheduler_eval = optim.lr_scheduler.CosineAnnealingLR(optimizer_eval, T_max=1000)
-
-print("Model architecture:")
-print(eval_model)
-
-# Example of enumerating child layers
-child_count = 0
-for child in eval_model.children():
-    child_count += 1
-    print(child)
-
-# Optional code to freeze specific layers:
-# ct = 0
-# for child in eval_model.children():
-#     ct += 1
-#     if ct < 2:  # Freeze the encoder, train only the linear head
-#         for param in child.parameters():
-#             param.requires_grad = False
+def parse_epoch(name: str) -> int:
+    try:
+        return int(os.path.splitext(os.path.basename(name))[0].split("_")[-1])
+    except Exception:
+        return -1
 
 
-# ------------------------------------------------------------------------
-# Training + Validation Loop
-# ------------------------------------------------------------------------
-def train_and_validate(
-    model,
-    train_loader,
-    val_loader,
-    criterion,
-    optimizer,
-    scheduler,
-    device=DEVICE,
-    epochs=201,
-    checkpoint_interval=20,
-    checkpoint_prefix="VR1_SiCoVa_Downstream"
-):
-    """
-    Train and validate the given model for a specified number of epochs.
+def evaluate(model, loader):
+    model.eval()
+    y_true, y_pred = [], []
+    with torch.no_grad():
+        for imgs, labels in loader:
+            imgs, labels = imgs.to(device), labels.to(device)
+            logits, _, _ = model(imgs)
+            y_true.extend(labels.cpu().tolist())
+            y_pred.extend(logits.argmax(1).cpu().tolist())
+    acc = accuracy_score(y_true, y_pred)
+    prec = precision_score(y_true, y_pred, average="macro", zero_division=0)
+    rec = recall_score(y_true, y_pred, average="macro", zero_division=0)
+    f1 = f1_score(y_true, y_pred, average="macro", zero_division=0)
+    cm = confusion_matrix(y_true, y_pred)
+    return acc, prec, rec, f1, cm
 
-    Args:
-        model (nn.Module): The model to train (e.g., LinearEvaluation).
-        train_loader (DataLoader): Dataloader for training data.
-        val_loader (DataLoader): Dataloader for validation data.
-        criterion (nn.Module): Loss function (e.g., CrossEntropyLoss).
-        optimizer (torch.optim.Optimizer): Optimizer instance.
-        scheduler (torch.optim.lr_scheduler._LRScheduler): LR scheduler instance.
-        device (torch.device): Device for computation (CPU/CUDA).
-        epochs (int): Number of epochs to train. Default is 201.
-        checkpoint_interval (int): Frequency of checkpoint saving. Default is 20.
-        checkpoint_prefix (str): Prefix for checkpoint filenames. Default is 'VR1_SiCoVa_Downstream'.
 
-    Returns:
-        None
-    """
-    for epoch in range(epochs):
-        # Training phase
+# =============================================================
+# 5 ─────────────────────────── Experiment config
+# =============================================================
+PRETRAIN_DIR = "/home/s13mchop/HybridML/experiments/pretrain/VR1_CLAHE_Jigsaw"
+RESULTS_ROOT = "/home/s13mchop/HybridML/experiments/aptos/1best_run/augs/downstream_results"
+TOTAL_DS_EPOCHS = 200
+EVAL_EPOCHS = {100, 200}
+NUM_CLASSES = 5
+PARTIAL_SAVE_EVERY = 10  # to allow resume within a ckpt
+
+# chunk support ─────────
+CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", 5))
+CHUNK_IDX = int(os.getenv("CHUNK_IDX", os.getenv("SLURM_ARRAY_TASK_ID", 0)))
+
+os.makedirs(RESULTS_ROOT, exist_ok=True)
+
+ckpt_paths = sorted(glob.glob(os.path.join(PRETRAIN_DIR, "*.pt")))
+if not ckpt_paths:
+    raise FileNotFoundError(f"No checkpoints found in {PRETRAIN_DIR}")
+
+# slice for this chunk
+start, end = CHUNK_IDX * CHUNK_SIZE, (CHUNK_IDX + 1) * CHUNK_SIZE
+ckpt_paths = ckpt_paths[start:end]
+print(f"Chunk {CHUNK_IDX}: {len(ckpt_paths)} checkpoints → {ckpt_paths}")
+
+if not ckpt_paths:
+    print("Nothing to do for this chunk — exiting.")
+    exit(0)
+
+CSV_PATH = os.path.join(RESULTS_ROOT, "summary_metrics.csv")
+append_header = not os.path.exists(CSV_PATH)
+
+records = []
+
+# =============================================================
+# 6 ──────────────────────────── Training loop
+# =============================================================
+for ckpt_path in ckpt_paths:
+    pre_ep = parse_epoch(ckpt_path)
+    run_name = os.path.splitext(os.path.basename(ckpt_path))[0]
+    run_dir = os.path.join(RESULTS_ROOT, run_name)
+    os.makedirs(run_dir, exist_ok=True)
+
+    # build backbone and load encoder weights → map to backbone.* keys
+    backbone = VICRegNet().to(device)
+    raw = torch.load(ckpt_path, map_location=device)
+    state = raw.get("model_state_dict", raw)
+    mapped = {k.replace("encoder.", "backbone."): v for k, v in state.items()}
+    _ = backbone.load_state_dict(mapped, strict=False)
+
+    model = CAMClassification(backbone, NUM_CLASSES).to(device)
+    criterion = nn.CrossEntropyLoss()
+    optimiser = optim.SGD(model.parameters(), lr=0.003, momentum=0.9, weight_decay=1e-4)
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimiser, TOTAL_DS_EPOCHS)
+
+    # --- downstream training ---
+    for epoch in range(1, TOTAL_DS_EPOCHS + 1):
         model.train()
-        train_losses = []
-        train_accuracies = []
-
-        for x, y in tqdm(train_loader, desc=f"Train Epoch {epoch+1}"):
-            x, y = x.to(device), y.to(device)
-            logits = model(x)
-            loss = criterion(logits, y)
-
-            optimizer.zero_grad()
+        for imgs, labels in tqdm(train_loader, leave=False, desc=f"{run_name} e{epoch:03d}"):
+            imgs, labels = imgs.to(device), labels.to(device)
+            optimiser.zero_grad()
+            logits, _, loss_ref = model(imgs)
+            loss = criterion(logits, labels) + model.alpha * loss_ref
             loss.backward()
-            optimizer.step()
-
-            train_losses.append(loss.item())
-            accuracy = y.eq(logits.detach().argmax(dim=1)).float().mean()
-            train_accuracies.append(accuracy)
-
+            optimiser.step()
         scheduler.step()
 
-        # Save checkpoint
-        if (epoch + 1) % checkpoint_interval == 0:
-            ckpt_path = f"{checkpoint_prefix}_{epoch+1}"
-            torch.save(model.state_dict(), ckpt_path)
-            print(f"Saved checkpoint at epoch {epoch+1} to {ckpt_path}")
+        # partial save for resume safety
+        if epoch % PARTIAL_SAVE_EVERY == 0:
+            torch.save({
+                "epoch": epoch,
+                "model": model.state_dict(),
+                "optim": optimiser.state_dict(),
+            }, os.path.join(run_dir, "latest.pt"))
 
-        print(f"[Epoch {epoch+1}/{epochs}] Training Loss: {torch.tensor(train_losses).mean():.5f}, "
-              f"Training Acc: {torch.tensor(train_accuracies).mean():.5f}")
+        if epoch in EVAL_EPOCHS:
+            acc, prec, rec, f1, cm = evaluate(model, val_loader)
+            print(
+                f"Eval ▶ pre‑ep {pre_ep:3d}  ds‑ep {epoch:3d}  "
+                f"acc {acc:.4f}  prec {prec:.4f}  rec {rec:.4f}  f1 {f1:.4f}"
+            )
 
-        # Validation phase
-        model.eval()
-        val_losses = []
-        val_accuracies = []
+            # save downstream ckpt & confusion matrix
+            torch.save({
+                "pretrain_ckpt": ckpt_path,
+                "downstream_epoch": epoch,
+                "model_state_dict": model.state_dict(),
+            }, os.path.join(run_dir, f"downstream_epoch{epoch}.pt"))
+            np.save(os.path.join(run_dir, f"confusion_matrix_epoch{epoch}.npy"), cm)
 
-        with torch.no_grad():
-            for x, y in tqdm(val_loader, desc=f"Valid Epoch {epoch+1}"):
-                x, y = x.to(device), y.to(device)
-                logits = model(x)
-                loss = criterion(logits, y)
-                val_losses.append(loss.item())
+            records.append({
+                "pretrain_epoch": pre_ep,
+                "downstream_epoch": epoch,
+                "accuracy": round(acc * 100, 2),
+                "precision": round(prec * 100, 2),
+                "recall": round(rec * 100, 2),
+                "f1_score": round(f1 * 100, 2),
+            })
 
-                accuracy = y.eq(logits.detach().argmax(dim=1)).float().mean()
-                val_accuracies.append(accuracy)
+    # cleanup
+    del model, backbone, optimiser, scheduler
+    torch.cuda.empty_cache()
 
-        scheduler.step()
-
-        print(f"[Epoch {epoch+1}/{epochs}] Validation Loss: {torch.tensor(val_losses).mean():.5f}, "
-              f"Validation Acc: {torch.tensor(val_accuracies).mean():.5f}\n")
-
-
-# ------------------------------------------------------------------------
-# Main Execution
-# ------------------------------------------------------------------------
-if __name__ == "__main__":
-    train_and_validate(
-        model=eval_model,
-        train_loader=train_dl,
-        val_loader=valid_dl,
-        criterion=criterion_eval,
-        optimizer=optimizer_eval,
-        scheduler=scheduler_eval,
-        device=DEVICE,
-        epochs=201,
-        checkpoint_interval=20,
-        checkpoint_prefix="VR1_SiCoVa_Downstream"
-    )
-
-    # --------------------------------------------------------------------
-    # Additional Evaluation (Commented)
-    # --------------------------------------------------------------------
-    # eval_model.load_state_dict(torch.load('VR1_SiCoVa_Downstream_90'))
-    # correct = 0
-    # total = 0
-    # preds = []
-    # labels_list = []
-    # with torch.no_grad():
-    #     for i, element in enumerate(tqdm(valid_dl)):
-    #         image, label = element
-    #         image = image.to(DEVICE)
-    #         label = label.to(DEVICE)
-    #         outputs = eval_model(image)
-    #         _, predicted = torch.max(outputs.data, 1)
-    #         preds += predicted.cpu().numpy().tolist()
-    #         labels_list += label.cpu().numpy().tolist()
-    #         total += label.size(0)
-    #         correct += (predicted == label).sum().item()
-    #
-    # print(f"Accuracy: {100 * correct / total:.2f}%")
-    #
-    # target_names = ["Class0", "Class1", "Class2", "Class3", "Class4"]
-    # print(classification_report(labels_list, preds, target_names=target_names))
-    # print(cohen_kappa_score(labels_list, preds, weights='quadratic'))
-    #
-    # # Top-k Evaluation Example
-    # correct_k = 0
-    # total_k = 0
-    # with torch.no_grad():
-    #     for i, element in enumerate(tqdm(valid_dl)):
-    #         k = 5
-    #         image, label = element
-    #         image = image.to(DEVICE)
-    #         label = label.to(DEVICE)
-    #         batch_size = label.size(0)
-    #         outputs = eval_model(image)
-    #         _, pred = outputs.topk(k=k, dim=1)
-    #         pred = pred.t()
-    #         correct = pred.eq(label.view(1, -1).expand_as(pred))
-    #         correct_k += correct[:k].reshape(-1).float().sum(0, keepdim=True)
-    #         total_k += batch_size
-    #
-    # print(f"Top-5 Accuracy: {correct_k.mul_(100.0 / total_k).item():.2f}%")
+# =============================================================
+# 7 ──────────────────────────── Save aggregated CSV
+# =============================================================
+pd.DataFrame(records).to_csv(CSV_PATH, mode="a", header=append_header, index=False)
+print(f"All done for chunk {CHUNK_IDX}. Results appended to {CSV_PATH}.")
