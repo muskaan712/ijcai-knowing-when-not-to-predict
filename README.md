@@ -36,6 +36,13 @@ pip install -r requirements.txt
 
 Pretraining scripts expect images organised either as a flat folder of JPEG files (SiCoVa) or in `torchvision.datasets.ImageFolder` format (triplet). Paths to the data are defined near the top of each `pretrain.py` and should be edited to match your local copy of EyePACS or another retinal dataset.
 
+### Download Links
+
+- [EyePACS (Kaggle Diabetic Retinopathy Detection)](https://www.kaggle.com/c/diabetic-retinopathy-detection)  
+- [APTOS 2019 Blindness Detection](https://www.kaggle.com/competitions/aptos2019-blindness-detection)  
+- [Messidor Dataset](https://www.adcis.net/en/third-party/messidor2/)
+- [Fundus Dataset](https://zenodo.org/records/4647952#.YGNjXVUzbIU)  
+
 Fine-tuning uses the APTOS dataset and likewise requires updating `TRAIN_PATH`, `VAL_PATH` and `PRETRAIN_DIR` in `fine_tuning/train.py` to point to your data and pretrained checkpoints.
 
 ## Pretraining
