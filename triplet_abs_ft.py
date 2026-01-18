@@ -1,23 +1,19 @@
 """
-Triplet-SSL APTOS downstream DR classification
-with temperature scaling + confidence-based abstention (selective prediction).
+Triplet-SSL APTOS downstream DR classification with temperature scaling and 
+confidence-based abstention (selective prediction).
 
-What this script does (per SSL checkpoint):
+High-level overview:
 1) Load triplet-pretrained ResNet50 encoder checkpoint.
 2) Fine-tune downstream classifier on APTOS train split (supervised).
-3) Fit temperature scaling on a held-out calibration split (from train).
+3) Fit temperature scaling on held-out calibration split (from train).
 4) Evaluate on APTOS test split with abstention sweep.
-5) Save:
-   - epoch_xxx/abstention_metrics.csv
-   - epoch_xxx/temperature.json
-   - epoch_xxx/confusion_matrix.npy
-   - epoch_xxx/threshold_0p70/accepted.csv and rejected.csv (manifests only, no copying)
-   - summary_metrics.csv (append-safe)
+5) Save per-epoch metrics, temperature, confusion matrix, and acceptance/rejection manifests.
 
 Notes:
 - Accepted/rejected manifests are saved from the TEST set (VAL_PATH) only.
-- Split into train/calib is dynamic via random_split (no .npz saved),
-  but deterministic given CALIB_SEED.
+- Train/calib split is dynamic via random_split (deterministic given CALIB_SEED).
+- Temperature scaling is supervised calibration using held-out split.
+- Abstention is post-hoc and does NOT affect training.
 """
 
 import os
@@ -56,11 +52,15 @@ DATASET_NAME = "aptos"
 ARCH_NAME = "resnet50"
 SSL_TAG = "triplet_ssl"
 
-TRAIN_PATH = "/hpcwork/ni124545/data/aptos/train"
-VAL_PATH = "/hpcwork/ni124545/data/aptos/test"
+# Anonymous paths - replace with your data directories
+DATA_ROOT = os.getenv("DATA_ROOT", "/path/to/data")
+EXPERIMENTS_ROOT = os.getenv("EXPERIMENTS_ROOT", "/path/to/experiments")
 
-PRETRAIN_DIR = "/hpcwork/ni124545/aptos/triplet_ssl/triplet_ssl_checkpoints"
-RESULTS_ROOT = "/hpcwork/ni124545/aptos/abstention"
+TRAIN_PATH = os.path.join(DATA_ROOT, "aptos", "train")
+VAL_PATH = os.path.join(DATA_ROOT, "aptos", "test")
+
+PRETRAIN_DIR = os.path.join(EXPERIMENTS_ROOT, "aptos", "triplet_ssl", "triplet_ssl_checkpoints")
+RESULTS_ROOT = os.path.join(EXPERIMENTS_ROOT, "aptos", "abstention")
 
 CKPT_GLOB = "encoder_epoch_*.pth"  # example: encoder_epoch_10.pth
 
@@ -106,10 +106,27 @@ os.makedirs(RESULTS_ROOT, exist_ok=True)
 # 1) Data transforms
 # =============================================================
 class RemoveBackgroundTransform:
+    """
+    Remove low-intensity background pixels from medical images.
+    
+    Converts RGB to grayscale, applies binary threshold to identify background,
+    and sets background pixels to zero.
+    """
     def __init__(self, threshold=10):
+        """
+        Args:
+            threshold (int): Gray value threshold for background detection. Default: 10.
+        """
         self.threshold = threshold
 
     def __call__(self, img: Image.Image) -> Image.Image:
+        """
+        Args:
+            img (PIL.Image): Input image.
+        
+        Returns:
+            PIL.Image: Image with background removed.
+        """
         import cv2
         arr = np.array(img)
         gray = cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY) if arr.ndim == 3 else arr
@@ -118,11 +135,29 @@ class RemoveBackgroundTransform:
         return Image.fromarray(arr)
 
 class CLAHETransform:
+    """
+    Apply Contrast Limited Adaptive Histogram Equalization (CLAHE).
+    
+    Enhances local contrast in the L channel (LAB color space) to improve
+    visibility of retinal features in medical images. Works on RGB and grayscale.
+    """
     def __init__(self, clip_limit=2.0, tile_grid_size=(8, 8)):
+        """
+        Args:
+            clip_limit (float): Clip limit for CLAHE. Default: 2.0.
+            tile_grid_size (tuple): Grid size for adaptive histogram. Default: (8, 8).
+        """
         import cv2
         self.clahe = cv2.createCLAHE(clipLimit=clip_limit, tileGridSize=tile_grid_size)
 
     def __call__(self, img: Image.Image) -> Image.Image:
+        """
+        Args:
+            img (PIL.Image): Input image.
+        
+        Returns:
+            PIL.Image: CLAHE-enhanced image.
+        """
         import cv2
         arr = np.array(img)
         if arr.ndim == 3 and arr.shape[2] == 3:
@@ -189,11 +224,28 @@ print(f"Calibration split ▶ CALIB_FRAC={CALIB_FRAC}, CALIB_SEED={CALIB_SEED}\n
 # 3) Model definitions (Triplet SSL backbone + downstream head)
 # =============================================================
 class CAMExtractor(nn.Module):
+    """
+    Extract Class Activation Map (CAM) from feature maps.
+    
+    Applies a 1x1 convolution to generate channel-wise attention,
+    then normalizes per sample for interpretability.
+    """
     def __init__(self, in_ch):
+        """
+        Args:
+            in_ch (int): Number of input channels (feature map channels).
+        """
         super().__init__()
         self.conv = nn.Conv2d(in_ch, 1, kernel_size=1, bias=False)
 
     def forward(self, feat_map):
+        """
+        Args:
+            feat_map (torch.Tensor): Feature maps (B, C, H, W).
+        
+        Returns:
+            torch.Tensor: Normalized CAM (B, H, W).
+        """
         cam = F.relu(self.conv(feat_map)).squeeze(1)  # [B,H,W]
         B, H, W = cam.shape
         flat = cam.view(B, -1)
@@ -201,11 +253,30 @@ class CAMExtractor(nn.Module):
         return ((flat - mn) / (mx - mn)).view(B, H, W)
 
 class RefinementCAM(nn.Module):
+    """
+    Refine CAM using multi-threshold masking and self-attention.
+    
+    Creates soft masks at multiple confidence thresholds, applies spatial
+    attention to feature maps, and regularizes refined CAM with L1 loss.
+    """
     def __init__(self, thresholds=(0.3, 0.4, 0.5)):
+        """
+        Args:
+            thresholds (tuple): CAM confidence thresholds for multi-scale masking. 
+                Default: (0.3, 0.4, 0.5).
+        """
         super().__init__()
         self.thresholds = thresholds
 
     def forward(self, cam, feat):
+        """
+        Args:
+            cam (torch.Tensor): Input CAM (B, H, W).
+            feat (torch.Tensor): Feature maps (B, C, H, W).
+        
+        Returns:
+            tuple: (refined_cam, refinement_loss).
+        """
         masks = [(cam >= t).float() for t in self.thresholds]
         m = torch.stack(masks, 1).mean(1).unsqueeze(1)  # [B,1,H,W]
         if m.shape[-2:] != feat.shape[-2:]:
@@ -217,6 +288,18 @@ class RefinementCAM(nn.Module):
 
     @staticmethod
     def self_att(cam, feat):
+        """
+        Apply self-attention over feature maps weighted by CAM.
+        
+        Computes pairwise feature similarity and aggregates using CAM as weights.
+        
+        Args:
+            cam (torch.Tensor): CAM (B, H, W).
+            feat (torch.Tensor): Masked features (B, C, H, W).
+        
+        Returns:
+            torch.Tensor: Refined CAM (B, H, W).
+        """
         B, C, H, W = feat.shape
         f = feat.view(B, C, -1)
         fn = F.normalize(f, dim=1)
@@ -227,7 +310,16 @@ class RefinementCAM(nn.Module):
         return ((out - mn) / (mx - mn)).view(B, H, W)
 
 class ResNet50TripletSelfSup(nn.Module):
+    """
+    ResNet50 encoder trained with triplet loss for self-supervised learning.
+    
+    Extracts feature maps and normalized embeddings for downstream tasks.
+    """
     def __init__(self, embedding_dim=128):
+        """
+        Args:
+            embedding_dim (int): Dimension of normalized embeddings. Default: 128.
+        """
         super().__init__()
         resnet = models.resnet50(pretrained=False)
         self.encoder = nn.Sequential(*list(resnet.children())[:-1])  # up to avgpool
@@ -235,6 +327,13 @@ class ResNet50TripletSelfSup(nn.Module):
         self.fc = nn.Linear(2048, embedding_dim)
 
     def forward(self, x):
+        """
+        Args:
+            x (torch.Tensor): Input images (B, 3, H, W).
+        
+        Returns:
+            tuple: (feature_maps, normalized_embeddings).
+        """
         feat = self.encoder[:-1](x)              # [B,2048,7,7]
         pooled = self.encoder[-1](feat)          # [B,2048,1,1]
         pooled = self.flatten(pooled)            # [B,2048]
@@ -245,9 +344,19 @@ class ResNet50TripletSelfSup(nn.Module):
 class TripletDownstreamModel(nn.Module):
     """
     Downstream classifier on top of triplet-pretrained embedding.
-    Returns logits (and optionally CAM refinement loss if enabled).
+    
+    Loads triplet SSL encoder, adds classification head, and optionally
+    includes CAM refinement loss for interpretability.
     """
     def __init__(self, encoder_ckpt_path, embedding_dim=128, num_classes=5, use_cam_loss=False, alpha=0.1):
+        """
+        Args:
+            encoder_ckpt_path (str): Path to triplet SSL encoder checkpoint.
+            embedding_dim (int): Embedding dimension. Default: 128.
+            num_classes (int): Number of output classes. Default: 5.
+            use_cam_loss (bool): Whether to use CAM refinement loss. Default: False.
+            alpha (float): Weight for CAM loss. Default: 0.1.
+        """
         super().__init__()
         self.use_cam_loss = use_cam_loss
         self.alpha = alpha
@@ -265,6 +374,13 @@ class TripletDownstreamModel(nn.Module):
         self.refiner = RefinementCAM()
 
     def forward(self, x):
+        """
+        Args:
+            x (torch.Tensor): Input images (B, 3, H, W).
+        
+        Returns:
+            tuple: (logits, refinement_loss or None).
+        """
         feat_map, emb = self.backbone(x)
         logits = self.cls_head(emb)
 
@@ -276,9 +392,19 @@ class TripletDownstreamModel(nn.Module):
         return logits, None
 
 # =============================================================
-# 4) Metrics, calibration, abstention saving (same style as SSL code)
+# 4) Metrics, calibration, abstention saving
 # =============================================================
 def compute_metrics(y_true, y_pred):
+    """
+    Compute classification metrics.
+    
+    Args:
+        y_true (array): Ground truth labels.
+        y_pred (array): Predicted labels.
+    
+    Returns:
+        tuple: (accuracy, precision, recall, f1, qwk) - all floats in [0, 1].
+    """
     acc = accuracy_score(y_true, y_pred)
     pr = precision_score(y_true, y_pred, average="macro", zero_division=0)
     rc = recall_score(y_true, y_pred, average="macro", zero_division=0)
@@ -287,12 +413,30 @@ def compute_metrics(y_true, y_pred):
     return acc, pr, rc, f1, qwk
 
 def _get_logits(out):
-    # out can be (logits, lr_loss) or logits
+    """
+    Extract logits from model output (which may include optional loss).
+    
+    Args:
+        out: Model output, either logits or (logits, loss) tuple.
+    
+    Returns:
+        torch.Tensor: Logits tensor.
+    """
     if isinstance(out, (tuple, list)):
         return out[0]
     return out
 
 def evaluate_standard(model, loader):
+    """
+    Evaluate classification model on a dataset.
+    
+    Args:
+        model (nn.Module): Model to evaluate.
+        loader (DataLoader): Data loader.
+    
+    Returns:
+        tuple: (accuracy, precision, recall, f1, qwk, confusion_matrix).
+    """
     model.eval()
     y_true, y_pred = [], []
     with torch.no_grad():
@@ -308,18 +452,46 @@ def evaluate_standard(model, loader):
     return acc, pr, rc, f1, qwk, cm
 
 class TemperatureScaler(nn.Module):
+    """
+    Learnable temperature scaling for confidence calibration.
+    
+    Divides logits by temperature T to calibrate predicted probabilities
+    to match empirical accuracy. Learned on held-out calibration set.
+    """
     def __init__(self):
+        """Initialize temperature parameter (log scale for numerical stability)."""
         super().__init__()
         self.log_T = nn.Parameter(torch.zeros(1))
 
     def forward(self, logits):
+        """
+        Args:
+            logits (torch.Tensor): Raw model outputs (B, C).
+        
+        Returns:
+            torch.Tensor: Scaled logits (B, C).
+        """
         return logits / torch.exp(self.log_T)
 
     @property
     def T(self):
+        """Get temperature value (exp of log_T)."""
         return float(torch.exp(self.log_T).detach().cpu().item())
 
 def fit_temperature(model, loader):
+    """
+    Fit temperature scaling on calibration set.
+    
+    Uses L-BFGS optimization to minimize cross-entropy loss on calibration data,
+    learning a single temperature parameter that calibrates confidence estimates.
+    
+    Args:
+        model (nn.Module): Trained model to calibrate.
+        loader (DataLoader): Calibration data loader.
+    
+    Returns:
+        TemperatureScaler: Fitted temperature scaler.
+    """
     model.eval()
     scaler = TemperatureScaler().to(device)
     nll = nn.CrossEntropyLoss()
@@ -348,16 +520,33 @@ def fit_temperature(model, loader):
     return scaler
 
 def _safe_threshold_folder(t: float) -> str:
+    """
+    Convert float threshold to safe folder name.
+    
+    Args:
+        t (float): Threshold value (e.g., 0.70).
+    
+    Returns:
+        str: Safe folder name (e.g., 'threshold_0p70').
+    """
     return f"threshold_{t:.2f}".replace(".", "p")
 
 def abstention_eval_and_save_manifests(model, loader, scaler, thresholds, out_epoch_dir: str):
     """
-    Saves (per epoch):
-      out_epoch_dir/abstention_metrics.csv
-      out_epoch_dir/threshold_0p70/accepted.csv
-      out_epoch_dir/threshold_0p70/rejected.csv
-
-    Manifests are saved from the TEST set (val_loader) only.
+    Evaluate selective prediction and save per-threshold acceptance/rejection manifests.
+    
+    For each confidence threshold, computes selective accuracy and saves
+    CSV files listing accepted/rejected samples with their predictions and confidence.
+    
+    Args:
+        model (nn.Module): Trained classifier.
+        loader (DataLoader): Validation data loader.
+        scaler (TemperatureScaler): Fitted temperature scaler.
+        thresholds (list): Confidence thresholds to evaluate.
+        out_epoch_dir (str): Output directory for results.
+    
+    Returns:
+        pd.DataFrame: Metrics per threshold (coverage, selective accuracy, F1, etc.).
     """
     model.eval()
     y_true_list, y_pred_list, conf_list, path_list = [], [], [], []

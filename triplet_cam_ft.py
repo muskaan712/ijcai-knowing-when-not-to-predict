@@ -1,3 +1,12 @@
+"""
+Triplet-SSL APTOS downstream DR classification with CAM refinement.
+
+High-level overview:
+1) Load triplet-pretrained ResNet50 encoder checkpoint.
+2) Fine-tune downstream classifier on APTOS train split with CAM refinement.
+3) Evaluate at selected downstream epochs.
+4) CAM refinement adds self-attention regularization to improve feature localization.
+"""
 import os
 import glob
 import warnings
@@ -20,6 +29,7 @@ from sklearn.metrics import (
 )
 from torch.utils.data import DataLoader
 from torchvision.datasets import ImageFolder
+from torchvision import models
 from tqdm import tqdm
 
 # ─── Config & Device ─────────────────────────────────────────────────────────
@@ -27,11 +37,33 @@ warnings.filterwarnings("ignore")
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}\n")
 
+# Anonymous paths - replace with your data directories
+DATA_ROOT = os.getenv("DATA_ROOT", "/path/to/data")
+EXPERIMENTS_ROOT = os.getenv("EXPERIMENTS_ROOT", "/path/to/experiments")
+
 # ─── 1) Data Transforms ───────────────────────────────────────────────────────
 class RemoveBackgroundTransform:
+    """
+    Remove low-intensity background pixels from medical images.
+    
+    Converts RGB to grayscale, applies binary threshold to identify background,
+    and sets background pixels to zero.
+    """
     def __init__(self, threshold=10):
+        """
+        Args:
+            threshold (int): Gray value threshold for background detection. Default: 10.
+        """
         self.threshold = threshold
+
     def __call__(self, img: Image.Image) -> Image.Image:
+        """
+        Args:
+            img (PIL.Image): Input image.
+        
+        Returns:
+            PIL.Image: Image with background removed.
+        """
         import cv2
         arr = np.array(img)
         gray = cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY) if arr.ndim == 3 else arr
@@ -40,10 +72,29 @@ class RemoveBackgroundTransform:
         return Image.fromarray(arr)
 
 class CLAHETransform:
+    """
+    Apply Contrast Limited Adaptive Histogram Equalization (CLAHE).
+    
+    Enhances local contrast in the L channel (LAB color space) to improve
+    visibility of retinal features in medical images.
+    """
     def __init__(self, clip_limit=2.0, tile_grid_size=(8, 8)):
+        """
+        Args:
+            clip_limit (float): Clip limit for CLAHE. Default: 2.0.
+            tile_grid_size (tuple): Grid size for adaptive histogram. Default: (8, 8).
+        """
         import cv2
         self.clahe = cv2.createCLAHE(clipLimit=clip_limit, tileGridSize=tile_grid_size)
+
     def __call__(self, img: Image.Image) -> Image.Image:
+        """
+        Args:
+            img (PIL.Image): Input image.
+        
+        Returns:
+            PIL.Image: CLAHE-enhanced image.
+        """
         import cv2
         arr = np.array(img)
         if arr.ndim == 3 and arr.shape[2] == 3:
@@ -65,8 +116,8 @@ transform = T.Compose([
 ])
 
 # ─── 2) Datasets & Loaders ───────────────────────────────────────────────────
-TRAIN_PATH = "/hpcwork/ni124545/data/aptos/train"
-VAL_PATH   = "/hpcwork/ni124545/data/aptos/test"
+TRAIN_PATH = os.path.join(DATA_ROOT, "aptos", "train")
+VAL_PATH   = os.path.join(DATA_ROOT, "aptos", "test")
 BATCH_SIZE  = 32
 NUM_WORKERS = os.cpu_count() or 4
 
@@ -82,10 +133,28 @@ print(f"Dataset sizes ▶ train: {len(train_ds)}   val: {len(val_ds)}")
 
 # ─── 3) CAM modules ──────────────────────────────────────────────────────────
 class CAMExtractor(nn.Module):
+    """
+    Extract Class Activation Map (CAM) from feature maps.
+    
+    Applies a 1x1 convolution to generate channel-wise attention,
+    then normalizes per sample for interpretability.
+    """
     def __init__(self, in_ch):
+        """
+        Args:
+            in_ch (int): Number of input channels (feature map channels).
+        """
         super().__init__()
         self.conv = nn.Conv2d(in_ch, 1, kernel_size=1, bias=False)
+
     def forward(self, feat_map):
+        """
+        Args:
+            feat_map (torch.Tensor): Feature maps (B, C, H, W).
+        
+        Returns:
+            torch.Tensor: Normalized CAM (B, H, W).
+        """
         cam = nn.functional.relu(self.conv(feat_map)).squeeze(1)  # [B,H,W]
         B,H,W = cam.shape
         flat = cam.view(B, -1)
@@ -93,10 +162,30 @@ class CAMExtractor(nn.Module):
         return ((flat - mn) / (mx - mn)).view(B, H, W)
 
 class RefinementCAM(nn.Module):
+    """
+    Refine CAM using multi-threshold masking and self-attention.
+    
+    Creates soft masks at multiple confidence thresholds, applies spatial
+    attention to feature maps, and regularizes refined CAM with L1 loss.
+    """
     def __init__(self, thresholds=(0.3,0.4,0.5)):
+        """
+        Args:
+            thresholds (tuple): CAM confidence thresholds for multi-scale masking. 
+                Default: (0.3, 0.4, 0.5).
+        """
         super().__init__()
         self.thresholds = thresholds
+
     def forward(self, cam, feat):
+        """
+        Args:
+            cam (torch.Tensor): Input CAM (B, H, W).
+            feat (torch.Tensor): Feature maps (B, C, H, W).
+        
+        Returns:
+            tuple: (refined_cam, refinement_loss).
+        """
         masks = [(cam >= t).float() for t in self.thresholds]
         m = torch.stack(masks,1).mean(1).unsqueeze(1)  # [B,1,H,W]
         if m.shape[-2:] != feat.shape[-2:]:
@@ -105,8 +194,21 @@ class RefinementCAM(nn.Module):
         ref = self.self_att(cam, masked)
         loss = nn.functional.l1_loss(ref, cam.detach())
         return ref, loss
+
     @staticmethod
     def self_att(cam, feat):
+        """
+        Apply self-attention over feature maps weighted by CAM.
+        
+        Computes pairwise feature similarity and aggregates using CAM as weights.
+        
+        Args:
+            cam (torch.Tensor): CAM (B, H, W).
+            feat (torch.Tensor): Masked features (B, C, H, W).
+        
+        Returns:
+            torch.Tensor: Refined CAM (B, H, W).
+        """
         B,C,H,W = feat.shape
         f = feat.view(B, C, -1)
         fn = nn.functional.normalize(f, dim=1)
@@ -117,9 +219,17 @@ class RefinementCAM(nn.Module):
         return ((out - mn)/(mx - mn)).view(B, H, W)
 
 # ─── 4) Triplet‐pretrained ResNet50 backbone ─────────────────────────────────
-from torchvision import models
 class ResNet50TripletSelfSup(nn.Module):
+    """
+    ResNet50 encoder trained with triplet loss for self-supervised learning.
+    
+    Extracts feature maps and normalized embeddings for downstream tasks.
+    """
     def __init__(self, embedding_dim=128):
+        """
+        Args:
+            embedding_dim (int): Dimension of normalized embeddings. Default: 128.
+        """
         super().__init__()
         resnet = models.resnet50(pretrained=False)
         # children() includes: conv1...layer4, avgpool, fc
@@ -127,7 +237,15 @@ class ResNet50TripletSelfSup(nn.Module):
         self.encoder = nn.Sequential(*list(resnet.children())[:-1])
         self.flatten = nn.Flatten()
         self.fc = nn.Linear(2048, embedding_dim)
+
     def forward(self, x):
+        """
+        Args:
+            x (torch.Tensor): Input images (B, 3, 224, 224).
+        
+        Returns:
+            tuple: (feature_maps, normalized_embeddings).
+        """
         # x -> [B,3,224,224]
         feat = self.encoder[:-1](x)    # exclude avgpool -> [B,2048,7,7]
         pooled = self.encoder[-1](feat)  # avgpool -> [B,2048,1,1]
@@ -138,7 +256,20 @@ class ResNet50TripletSelfSup(nn.Module):
 
 # ─── 5) Downstream CAM‐enabled model ─────────────────────────────────────────
 class CAMFinetuneResNet50(nn.Module):
+    """
+    Downstream classifier on top of triplet-pretrained embedding with CAM.
+    
+    Loads triplet SSL encoder, adds classification head, and includes
+    CAM refinement loss for interpretability and feature localization.
+    """
     def __init__(self, encoder_ckpt_path, embedding_dim=128, num_classes=5, alpha=0.1):
+        """
+        Args:
+            encoder_ckpt_path (str): Path to triplet SSL encoder checkpoint.
+            embedding_dim (int): Embedding dimension. Default: 128.
+            num_classes (int): Number of output classes. Default: 5.
+            alpha (float): Weight for CAM refinement loss. Default: 0.1.
+        """
         super().__init__()
         # load triplet‐trained backbone
         self.backbone = ResNet50TripletSelfSup(embedding_dim=embedding_dim)
@@ -152,15 +283,50 @@ class CAMFinetuneResNet50(nn.Module):
         self.refiner = RefinementCAM()
 
     def forward(self, x):
+        """
+        Args:
+            x (torch.Tensor): Input images (B, 3, 224, 224).
+        
+        Returns:
+            tuple: (logits, cam, refinement_loss).
+        """
         feat_map, emb = self.backbone(x)
         logits = self.cls_head(emb)
         cam0 = self.cam_ext(feat_map)               # [B,7,7]
         cam, lr_loss = self.refiner(cam0, feat_map) # [B,7,7], scalar
         return logits, cam, lr_loss
 
-# ─── 6) Chunking & checkpoint loop ──────────────────────────────────────────
-PRETRAIN_DIR       = "/hpcwork/ni124545/aptos/triplet_ssl/triplet_ssl_checkpoints"
-RESULTS_ROOT       = "/hpcwork/ni124545/aptos/triplet_ssl/downstream/jigsaw/2550/chunk0"
+# ─── 6) Evaluation function ──────────────────────────────────────────────────
+def evaluate(model, loader):
+    """
+    Evaluate classification model on a dataset.
+    
+    Args:
+        model (nn.Module): Model to evaluate.
+        loader (DataLoader): Data loader.
+    
+    Returns:
+        tuple: (accuracy, precision, recall, f1, confusion_matrix).
+    """
+    model.eval()
+    ys, ps = [], []
+    with torch.no_grad():
+        for imgs, labels in loader:
+            imgs, labels = imgs.to(device), labels.to(device)
+            logits, _, _ = model(imgs)
+            ys.extend(labels.cpu().tolist())
+            ps.extend(logits.argmax(1).cpu().tolist())
+    return (
+        accuracy_score(ys, ps),
+        precision_score(ys, ps, average="macro", zero_division=0),
+        recall_score(ys, ps, average="macro", zero_division=0),
+        f1_score(ys, ps, average="macro", zero_division=0),
+        confusion_matrix(ys, ps),
+    )
+
+# ─── 7) Chunking & checkpoint loop ──────────────────────────────────────────
+PRETRAIN_DIR       = os.path.join(EXPERIMENTS_ROOT, "aptos", "triplet_ssl", "triplet_ssl_checkpoints")
+RESULTS_ROOT       = os.path.join(EXPERIMENTS_ROOT, "aptos", "triplet_ssl", "downstream", "jigsaw", "2550", "chunk0")
 TOTAL_DS_EPOCHS    = 50
 EVAL_EPOCHS        = {25, 50}
 NUM_CLASSES        = 5
@@ -181,23 +347,9 @@ CSV_PATH    = os.path.join(RESULTS_ROOT, "summary_metrics.csv")
 append_head = not os.path.exists(CSV_PATH)
 records     = []
 
-def evaluate(model, loader):
-    model.eval()
-    ys, ps = [], []
-    with torch.no_grad():
-        for imgs, labels in loader:
-            imgs, labels = imgs.to(device), labels.to(device)
-            logits, _, _ = model(imgs)
-            ys.extend(labels.cpu().tolist())
-            ps.extend(logits.argmax(1).cpu().tolist())
-    return (
-        accuracy_score(ys, ps),
-        precision_score(ys, ps, average="macro", zero_division=0),
-        recall_score(ys, ps, average="macro", zero_division=0),
-        f1_score(ys, ps, average="macro", zero_division=0),
-        confusion_matrix(ys, ps),
-    )
-
+# =============================================================
+# 8) Main Training Loop
+# =============================================================
 for ckpt in ckpts:
     run_name = os.path.splitext(os.path.basename(ckpt))[0]
     run_dir  = os.path.join(RESULTS_ROOT, run_name)
@@ -253,6 +405,9 @@ for ckpt in ckpts:
     del model, optim_, sched
     torch.cuda.empty_cache()
 
+# =============================================================
+# 9) Save Summary (append-safe)
+# =============================================================
 if records:
     pd.DataFrame(records).to_csv(CSV_PATH, mode="a", header=append_head, index=False)
     print(f"Appended metrics to {CSV_PATH}")

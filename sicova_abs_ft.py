@@ -50,11 +50,15 @@ DATASET_NAME = "aptos"
 ARCH_NAME = "resnet50"
 SSL_TAG = "VR1_CLAHE_Jigsaw"
 
-TRAIN_PATH = "/home/s13mchop/sicova/data/aptos/train"
-VAL_PATH = "/home/s13mchop/sicova/data/aptos/test"
+# Anonymous paths - replace with your data directories
+DATA_ROOT = os.getenv("DATA_ROOT", "/path/to/data")
+EXPERIMENTS_ROOT = os.getenv("EXPERIMENTS_ROOT", "/path/to/experiments")
 
-PRETRAIN_DIR = "/home/s13mchop/sicova/experiments/pretrain/VR1_CLAHE_Jigsaw"
-RESULTS_ROOT = "/home/s13mchop/sicova/experiments/aptos/abs/downstreamresults"
+TRAIN_PATH = os.path.join(DATA_ROOT, "aptos", "train")
+VAL_PATH = os.path.join(DATA_ROOT, "aptos", "test")
+
+PRETRAIN_DIR = os.path.join(EXPERIMENTS_ROOT, "pretrain", SSL_TAG)
+RESULTS_ROOT = os.path.join(EXPERIMENTS_ROOT, "aptos", "abs", "downstreamresults")
 
 NUM_CLASSES = 5
 BATCH_SIZE = 32
@@ -95,6 +99,12 @@ def exclude_bias_and_norm(n):
     This function was referenced during SSL pretraining and must exist
     at load time for torch.load to succeed. It is NOT used in downstream
     training or evaluation.
+    
+    Args:
+        n (str): Parameter name from state dict.
+    
+    Returns:
+        bool: True if name contains bias or norm layers.
     """
     return n.endswith(".bias") or "norm" in n.lower()
 
@@ -103,10 +113,27 @@ def exclude_bias_and_norm(n):
 # 1) DATA TRANSFORMS
 # =============================================================
 class RemoveBackgroundTransform:
+    """
+    Removes background from medical images using binary thresholding.
+    
+    Converts RGB to grayscale, applies binary threshold to identify background,
+    and sets background pixels to zero.
+    """
     def __init__(self, threshold: int = 10):
+        """
+        Args:
+            threshold (int): Gray value threshold for background detection. Default: 10.
+        """
         self.threshold = threshold
 
     def __call__(self, img: Image.Image) -> Image.Image:
+        """
+        Args:
+            img (PIL.Image): Input image.
+        
+        Returns:
+            PIL.Image: Image with background removed.
+        """
         import cv2
         arr = np.array(img)
         gray = cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY)
@@ -115,11 +142,29 @@ class RemoveBackgroundTransform:
         return Image.fromarray(arr)
 
 class CLAHETransform:
+    """
+    Applies Contrast Limited Adaptive Histogram Equalization (CLAHE).
+    
+    Enhances local contrast in the L channel (LAB color space) to improve
+    visibility of retinal features in fundus images.
+    """
     def __init__(self, clip_limit=2.0, tile_grid_size=(8, 8)):
+        """
+        Args:
+            clip_limit (float): Clip limit for CLAHE. Default: 2.0.
+            tile_grid_size (tuple): Grid size for adaptive histogram. Default: (8, 8).
+        """
         import cv2
         self.clahe = cv2.createCLAHE(clipLimit=clip_limit, tileGridSize=tile_grid_size)
 
     def __call__(self, img: Image.Image) -> Image.Image:
+        """
+        Args:
+            img (PIL.Image): Input image.
+        
+        Returns:
+            PIL.Image: CLAHE-enhanced image.
+        """
         import cv2
         arr = np.array(img)
         lab = cv2.cvtColor(arr, cv2.COLOR_RGB2LAB)
@@ -170,7 +215,14 @@ print(f"Calibration split ▶ CALIB_FRAC={CALIB_FRAC}, CALIB_SEED={CALIB_SEED}\n
 # 3) MODEL DEFINITIONS
 # =============================================================
 class VICRegNet(nn.Module):
+    """
+    SSL-pretrained ResNet50 backbone with feature extraction.
+    
+    Extracts feature maps, pooled representations, and expanded embeddings.
+    Used as feature extractor for downstream classification task.
+    """
     def __init__(self):
+        """Initialize ResNet50 backbone and expansion head."""
         super().__init__()
         base = models.resnet50(weights=models.ResNet50_Weights.IMAGENET1K_V2)
         self.backbone = nn.Sequential(*list(base.children())[:-2])
@@ -188,19 +240,43 @@ class VICRegNet(nn.Module):
         )
 
     def forward(self, x):
+        """
+        Args:
+            x (torch.Tensor): Input images (B, 3, H, W).
+        
+        Returns:
+            tuple: (feature_maps, pooled_features, expanded_embeddings)
+        """
         fmap = self.backbone(x)
         pooled = self.avgpool(fmap).view(x.size(0), -1)
         emb = self.expander(pooled)
         return fmap, pooled, emb
 
 class LinearClassifier(nn.Module):
-    """Simple classifier head on pooled ResNet50 features (no CAM)."""
+    """
+    Simple linear classifier head on ResNet50 pooled features.
+    
+    Maps pooled backbone features (2048-d) to NUM_CLASSES predictions
+    for downstream DR classification task.
+    """
     def __init__(self, backbone: nn.Module, num_classes: int = 5):
+        """
+        Args:
+            backbone (nn.Module): Pretrained VICRegNet backbone.
+            num_classes (int): Number of output classes. Default: 5.
+        """
         super().__init__()
         self.backbone = backbone
         self.cls = nn.Linear(2048, num_classes)
 
     def forward(self, x):
+        """
+        Args:
+            x (torch.Tensor): Input images (B, 3, H, W).
+        
+        Returns:
+            torch.Tensor: Logits (B, num_classes).
+        """
         _, pooled, _ = self.backbone(x)
         logits = self.cls(pooled)
         return logits
@@ -209,6 +285,16 @@ class LinearClassifier(nn.Module):
 # 4) METRICS, CALIBRATION, ABSTENTION + MANIFESTS
 # =============================================================
 def compute_metrics(y_true, y_pred):
+    """
+    Compute classification metrics.
+    
+    Args:
+        y_true (array): Ground truth labels.
+        y_pred (array): Predicted labels.
+    
+    Returns:
+        tuple: (accuracy, precision, recall, f1, qwk) - all floats in [0, 1].
+    """
     acc = accuracy_score(y_true, y_pred)
     pr = precision_score(y_true, y_pred, average="macro", zero_division=0)
     rc = recall_score(y_true, y_pred, average="macro", zero_division=0)
@@ -217,6 +303,16 @@ def compute_metrics(y_true, y_pred):
     return acc, pr, rc, f1, qwk
 
 def evaluate(model, loader):
+    """
+    Evaluate model on a dataset.
+    
+    Args:
+        model (nn.Module): Model to evaluate.
+        loader (DataLoader): Data loader.
+    
+    Returns:
+        tuple: (accuracy, precision, recall, f1, qwk, confusion_matrix).
+    """
     model.eval()
     y_true, y_pred = [], []
 
@@ -232,18 +328,46 @@ def evaluate(model, loader):
     return acc, pr, rc, f1, qwk, cm
 
 class TemperatureScaler(nn.Module):
+    """
+    Learnable temperature scaling for confidence calibration.
+    
+    Divides logits by temperature T to calibrate predicted probabilities
+    to match empirical accuracy. Learned on held-out calibration set.
+    """
     def __init__(self):
+        """Initialize temperature parameter (log scale for numerical stability)."""
         super().__init__()
         self.log_T = nn.Parameter(torch.zeros(1))
 
     def forward(self, logits):
+        """
+        Args:
+            logits (torch.Tensor): Raw model outputs (B, C).
+        
+        Returns:
+            torch.Tensor: Scaled logits (B, C).
+        """
         return logits / torch.exp(self.log_T)
 
     @property
     def T(self):
+        """Get temperature value (exp of log_T)."""
         return float(torch.exp(self.log_T).detach().cpu().item())
 
 def fit_temperature(model, loader):
+    """
+    Fit temperature scaling on calibration set.
+    
+    Uses L-BFGS optimization to minimize cross-entropy loss on calibration data,
+    learning a single temperature parameter that calibrates confidence estimates.
+    
+    Args:
+        model (nn.Module): Trained model to calibrate.
+        loader (DataLoader): Calibration data loader.
+    
+    Returns:
+        TemperatureScaler: Fitted temperature scaler.
+    """
     model.eval()
     scaler = TemperatureScaler().to(device)
     nll = nn.CrossEntropyLoss()
@@ -270,7 +394,15 @@ def fit_temperature(model, loader):
     return scaler
 
 def _safe_threshold_folder(t: float) -> str:
-    # stable folder names like threshold_0p70
+    """
+    Convert float threshold to safe folder name.
+    
+    Args:
+        t (float): Threshold value (e.g., 0.70).
+    
+    Returns:
+        str: Safe folder name (e.g., 'threshold_0p70').
+    """
     return f"threshold_{t:.2f}".replace(".", "p")
 
 def abstention_eval_and_save_manifests(
@@ -281,10 +413,20 @@ def abstention_eval_and_save_manifests(
     out_epoch_dir: str,
 ):
     """
-    Saves (per epoch):
-      out_epoch_dir/abstention_metrics.csv
-      out_epoch_dir/threshold_0p70/accepted.csv
-      out_epoch_dir/threshold_0p70/rejected.csv
+    Evaluate selective prediction and save per-threshold acceptance/rejection manifests.
+    
+    For each confidence threshold, computes selective accuracy and saves
+    CSV files listing accepted/rejected samples with their predictions and confidence.
+    
+    Args:
+        model (nn.Module): Trained classifier.
+        loader (DataLoader): Validation data loader.
+        scaler (TemperatureScaler): Fitted temperature scaler.
+        thresholds (list): Confidence thresholds to evaluate.
+        out_epoch_dir (str): Output directory for results.
+    
+    Returns:
+        pd.DataFrame: Metrics per threshold (coverage, selective accuracy, F1, etc.).
     """
     model.eval()
     y_true_list, y_pred_list, conf_list, path_list = [], [], [], []
