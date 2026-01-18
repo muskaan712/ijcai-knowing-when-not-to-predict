@@ -305,7 +305,7 @@ torch.backends.cudnn.deterministic = True
 
 This project is released under the [MIT License](LICENSE).
 
-## Citation
+<!-- ## Citation
 
 If you find this repository useful in your research, please cite:
 
@@ -323,7 +323,7 @@ If you find this repository useful in your research, please cite:
   booktitle={CVPR},
   year={2015}
 }
-```
+``` -->
 
 ## Acknowledgements
 
